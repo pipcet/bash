@@ -25,6 +25,7 @@
 
 #include <config.h>
 
+#undef HAVE_NETWORK
 #if defined (HAVE_NETWORK)
 
 #if defined (HAVE_UNISTD_H)

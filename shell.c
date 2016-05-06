@@ -1673,10 +1673,14 @@ get_current_user_info ()
   /* Don't fetch this more than once. */
   if (current_user.user_name == 0)
     {
+#if 0
 #if defined (__TANDEM)
       entry = getpwnam (getlogin ());
 #else
       entry = getpwuid (current_user.uid);
+#endif
+#else
+      entry = NULL;
 #endif
       if (entry)
 	{
@@ -1693,7 +1697,9 @@ get_current_user_info ()
 	  current_user.shell = savestring ("/bin/sh");
 	  current_user.home_dir = savestring ("/");
 	}
+#if 0
       endpwent ();
+#endif
     }
 }
 
