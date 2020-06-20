@@ -1,6 +1,6 @@
 /* evalstring.c - evaluate a string as one or more shell commands. */
 
-/* Copyright (C) 1996-2015 Free Software Foundation, Inc.
+/* Copyright (C) 1996-2017 Free Software Foundation, Inc.
 
    This file is part of GNU Bash, the Bourne Again SHell.
 
@@ -39,6 +39,7 @@
 #include "../jobs.h"
 #include "../builtins.h"
 #include "../flags.h"
+#include "../parser.h"
 #include "../input.h"
 #include "../execute_cmd.h"
 #include "../redir.h"
@@ -59,19 +60,6 @@ extern int errno;
 #endif
 
 #define IS_BUILTIN(s)	(builtin_address_internal(s, 0) != (struct builtin *)NULL)
-
-extern int indirection_level, subshell_environment;
-extern int line_number, line_number_for_err_trap;
-extern int current_token, shell_eof_token;
-extern int last_command_exit_value;
-extern int running_trap;
-extern int loop_level;
-extern int executing_list;
-extern int comsub_ignore_return;
-extern int posixly_correct;
-extern int return_catch_flag, return_catch_value;
-extern sh_builtin_func_t *this_shell_builtin;
-extern char *the_printed_command_except_trap;
 
 int parse_and_execute_level = 0;
 
@@ -103,6 +91,7 @@ should_suppress_fork (command)
   return (startup_state == 2 && parse_and_execute_level == 1 &&
 	  running_trap == 0 &&
 	  *bash_input.location.string == '\0' &&
+	  parser_expanding_alias () == 0 &&
 	  command->type == cm_simple &&
 	  signal_is_trapped (EXIT_TRAP) == 0 &&
 	  signal_is_trapped (ERROR_TRAP) == 0 &&
@@ -112,26 +101,64 @@ should_suppress_fork (command)
 	  ((command->flags & CMD_INVERT_RETURN) == 0));
 }
 
+int
+can_optimize_connection (command)
+     COMMAND *command;
+{
+  return (*bash_input.location.string == '\0' &&
+	  parser_expanding_alias () == 0 &&
+	  (command->value.Connection->connector == AND_AND || command->value.Connection->connector == OR_OR || command->value.Connection->connector == ';') &&
+	  command->value.Connection->second->type == cm_simple);
+}
+
 void
 optimize_fork (command)
      COMMAND *command;
 {
   if (command->type == cm_connection &&
-      (command->value.Connection->connector == AND_AND || command->value.Connection->connector == OR_OR) &&
+      (command->value.Connection->connector == AND_AND || command->value.Connection->connector == OR_OR || command->value.Connection->connector == ';') &&
+      (command->value.Connection->second->flags & CMD_TRY_OPTIMIZING) &&
       should_suppress_fork (command->value.Connection->second))
     {
       command->value.Connection->second->flags |= CMD_NO_FORK;
       command->value.Connection->second->value.Simple->flags |= CMD_NO_FORK;
     }
 }
+
+void
+optimize_subshell_command (command)
+     COMMAND *command;
+{
+  if (running_trap == 0 &&
+      command->type == cm_simple &&
+      signal_is_trapped (EXIT_TRAP) == 0 &&
+      signal_is_trapped (ERROR_TRAP) == 0 &&
+      any_signals_trapped () < 0 &&
+      command->redirects == 0 && command->value.Simple->redirects == 0 &&
+      ((command->flags & CMD_TIME_PIPELINE) == 0) &&
+      ((command->flags & CMD_INVERT_RETURN) == 0))
+    {
+      command->flags |= CMD_NO_FORK;
+      command->value.Simple->flags |= CMD_NO_FORK;
+    }
+  else if (command->type == cm_connection &&
+	   (command->value.Connection->connector == AND_AND || command->value.Connection->connector == OR_OR))
+    optimize_subshell_command (command->value.Connection->second);
+}
      
 /* How to force parse_and_execute () to clean up after itself. */
 void
-parse_and_execute_cleanup ()
+parse_and_execute_cleanup (old_running_trap)
+     int old_running_trap;
 {
-  if (running_trap)
+  if (running_trap > 0)
     {
-      run_trap_cleanup (running_trap - 1);
+      /* We assume if we have a different value for running_trap than when
+	 we started (the only caller that cares is evalstring()), the
+	 original caller will perform the cleanup, and we should not step
+	 on them. */
+      if (running_trap != old_running_trap)
+	run_trap_cleanup (running_trap - 1);
       unfreeze_jobs_list ();
     }
 
@@ -265,7 +292,7 @@ parse_and_execute (string, from_file, flags)
 
   with_input_from_string (string, from_file);
   clear_shell_input_line ();
-  while (*(bash_input.location.string))
+  while (*(bash_input.location.string) || parser_expanding_alias ())
     {
       command = (COMMAND *)NULL;
 
@@ -397,8 +424,18 @@ parse_and_execute (string, from_file, flags)
 		  command->flags |= CMD_NO_FORK;
 		  command->value.Simple->flags |= CMD_NO_FORK;
 		}
-	      else if (command->type == cm_connection)
-		optimize_fork (command);
+
+	      /* Can't optimize forks out here execept for simple commands.
+		 This knows that the parser sets up commands as left-side heavy
+		 (&& and || are left-associative) and after the single parse,
+		 if we are at the end of the command string, the last in a
+		 series of connection commands is
+		 command->value.Connection->second. */
+	      else if (command->type == cm_connection && can_optimize_connection (command))
+		{
+		  command->value.Connection->second->flags |= CMD_TRY_OPTIMIZING;
+		  command->value.Connection->second->value.Simple->flags |= CMD_TRY_OPTIMIZING;
+		}
 #endif /* ONESHOT */
 
 	      /* See if this is a candidate for $( <file ). */
@@ -433,11 +470,11 @@ parse_and_execute (string, from_file, flags)
 	}
       else
 	{
-	  last_result = EXECUTION_FAILURE;
+	  last_result = EX_BADUSAGE;	/* was EXECUTION_FAILURE */
 
 	  if (interactive_shell == 0 && this_shell_builtin &&
 	      (this_shell_builtin == source_builtin || this_shell_builtin == eval_builtin) &&
-	      last_command_exit_value == EX_BADSYNTAX && posixly_correct)
+	      last_command_exit_value == EX_BADSYNTAX && posixly_correct && executing_command_builtin == 0)
 	    {
 	      should_jump_to_top_level = 1;
 	      code = ERREXIT;
@@ -510,7 +547,7 @@ parse_string (string, from_file, flags, endp)
   ostring = string;
 
   with_input_from_string (string, from_file);
-  while (*(bash_input.location.string))
+  while (*(bash_input.location.string))		/* XXX - parser_expanding_alias () ? */
     {
       command = (COMMAND *)NULL;
 
@@ -644,6 +681,10 @@ evalstring (string, from_file, flags)
      int flags;
 {
   volatile int r, rflag, rcatch;
+  volatile int was_trap;
+
+  /* Are we running a trap when we execute this function? */
+  was_trap = running_trap;
 
   rcatch = 0;
   rflag = return_catch_flag;
@@ -663,7 +704,9 @@ evalstring (string, from_file, flags)
 
   if (rcatch)
     {
-      parse_and_execute_cleanup ();
+      /* We care about whether or not we are running the same trap we were
+	 when we entered this function. */
+      parse_and_execute_cleanup (was_trap);
       r = return_catch_value;
     }
   else
