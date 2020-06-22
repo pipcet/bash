@@ -341,6 +341,8 @@ udpopen (host, serv)
 
 #else /* !HAVE_NETWORK */
 
+#include <bashintl.h>
+
 int
 netopen (path)
      char *path;
