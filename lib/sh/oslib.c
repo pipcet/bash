@@ -55,7 +55,7 @@ extern int errno;
 #if !defined (HAVE_STRCHR)
 char *
 strchr (string, c)
-     char *string;
+     const char *string;
      int c;
 {
   register char *s;
@@ -69,7 +69,7 @@ strchr (string, c)
 
 char *
 strrchr (string, c)
-     char *string;
+     const char *string;
      int c;
 {
   register char *s, *t;
